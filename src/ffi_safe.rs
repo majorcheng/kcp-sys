@@ -169,6 +169,23 @@ impl Kcp {
         }
     }
 
+    /// 单次 `ikcp_send` 能接受的最大长度。
+    ///
+    /// KCP 会把数据切成 mss 大小的分片，分片数上限是 `IKCP_WND_RCV - 1`；
+    /// 超过时 `ikcp_send` 返回负值。调用方必须先按这个上限分块。
+    pub fn max_chunk_size(&self) -> usize {
+        // https://github.com/skywind3000/kcp/blob/f4f3a89cc632647dabdcb146932d2afd5591e62e/ikcp.c#L512
+        // https://github.com/skywind3000/kcp/issues/428
+        const IKCP_WND_RCV: u32 = 128;
+        const MIN_CHUNK_SIZE: usize = 1024;
+        let mss = unsafe { (*self.kcp).mss };
+        let sndwnd = unsafe { (*self.kcp).snd_wnd };
+        let rcvwnd = unsafe { (*self.kcp).rcv_wnd };
+        let max_count = std::cmp::min(IKCP_WND_RCV - 1, std::cmp::min(sndwnd, rcvwnd));
+        let truncate_size = (max_count as usize) * (mss as usize);
+        truncate_size.max(MIN_CHUNK_SIZE)
+    }
+
     pub fn flush(&mut self) {
         unsafe {
             ikcp_flush(self.kcp);

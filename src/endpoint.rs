@@ -164,23 +164,34 @@ impl KcpConnection {
         self.tasks.spawn(
             async move {
                 while let Some(data) = send_receiver.recv().await {
-                    loop {
-                        let (waitsnd, sndwnd) = {
-                            let kcp = kcp.lock();
-                            (kcp.waitsnd(), kcp.sendwnd())
-                        };
-                        if waitsnd > 2 * sndwnd {
-                            inner
-                                .waiting_new_send_window
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            inner.send_notifier.notified().await;
-                        } else {
+                    // ikcp_send 单次最多接受 (IKCP_WND_RCV - 1) 个 mss 分片，超限时返回负值。
+                    // 这里先按上限分块，避免把大帧直接交给 KCP。
+                    let data = data.freeze();
+                    let max_send = kcp.lock().max_chunk_size();
+                    for chunk in data.chunks(max_send) {
+                        // flow control wait
+                        loop {
+                            let (waitsnd, sndwnd) = {
+                                let kcp = kcp.lock();
+                                (kcp.waitsnd(), kcp.sendwnd())
+                            };
+                            if waitsnd > 2 * sndwnd {
+                                inner
+                                    .waiting_new_send_window
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                inner.send_notifier.notified().await;
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Err(e) = kcp.lock().send(Bytes::copy_from_slice(chunk)) {
+                            // 与旧实现一致：记录后丢弃这一块，不让发送任务 panic。
+                            tracing::error!("send data failed: {:?}, len: {}", e, chunk.len());
                             break;
                         }
+                        kcp.lock().flush();
+                        inner.update_notifier.notify_one();
                     }
-                    kcp.lock().send(data.freeze()).unwrap();
-                    kcp.lock().flush();
-                    inner.update_notifier.notify_one();
                 }
 
                 tracing::debug!(
