@@ -902,4 +902,44 @@ mod tests {
 
         t.join_all().await;
     }
+
+    /// 单次 `ikcp_send` 最多 127 个 mss 分片（默认 MTU 1400 时约 170 KiB），
+    /// 超过时返回 -2。发送路径必须先分块，否则大写入会被丢弃甚至 panic。
+    #[tokio::test]
+    async fn large_send_is_chunked_not_dropped() {
+        let (client_endpoint, server_endpoint, t) = prepare_test().await;
+
+        let (connect_ret, accept_ret) = tokio::join!(
+            client_endpoint.connect(std::time::Duration::from_secs(1), 1, 3, Bytes::new()),
+            server_endpoint.accept()
+        );
+        let conv = connect_ret.unwrap();
+        assert_eq!(conv, accept_ret.unwrap());
+
+        let (client_sender, _client_receiver) =
+            client_endpoint.conn_sender_receiver(conv).unwrap();
+        let (_server_sender, mut server_receiver) =
+            server_endpoint.conn_sender_receiver(conv).unwrap();
+
+        let payload = BytesMut::from(&vec![0x5au8; 300 * 1024][..]);
+        client_sender.send(payload.clone()).await.unwrap();
+
+        // 接收侧按 KCP 分片交付，累计到全量为止。
+        let mut total = 0usize;
+        while total < payload.len() {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_receiver.recv(),
+            )
+            .await
+            .expect("大块发送超时")
+            .expect("连接提前关闭");
+            total += chunk.len();
+        }
+        assert_eq!(total, payload.len());
+
+        drop(client_endpoint);
+        drop(server_endpoint);
+        t.join_all().await;
+    }
 }
